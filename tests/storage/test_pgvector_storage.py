@@ -423,6 +423,22 @@ class TestPgVectorIntegration:
         results = await real_storage.semantic_search("semantic search alias", n_results=3)
         assert any(r.memory.content_hash == memory.content_hash for r in results)
 
+    async def test_delete_by_all_tags_requires_full_intersection(self, real_storage):
+        """ALL-tag delete only removes memories whose tag set is a superset
+        of the query — missing one tag spares the memory."""
+        m_full = _make_memory("contains all tags", tags=["a", "b", "c"])
+        m_partial = _make_memory("missing one tag", tags=["a", "c"])
+        m_other = _make_memory("unrelated", tags=["x"])
+        for m in (m_full, m_partial, m_other):
+            await real_storage.store(m)
+
+        count, _ = await real_storage.delete_by_all_tags(["a", "b"])
+        assert count == 1
+
+        assert await real_storage.get_by_hash(m_full.content_hash) is None
+        assert await real_storage.get_by_hash(m_partial.content_hash) is not None
+        assert await real_storage.get_by_hash(m_other.content_hash) is not None
+
     async def test_search_all_memories_returns_active(self, real_storage):
         m1 = _make_memory("all memories 1")
         m2 = _make_memory("all memories 2")

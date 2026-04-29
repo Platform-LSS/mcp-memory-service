@@ -651,6 +651,38 @@ class PgVectorMemoryStorage(MemoryStorage):
             logger.error("delete() failed: %s", e)
             return False, f"Failed to delete memory: {e}"
 
+    async def delete_by_all_tags(self, tags: List[str]) -> Tuple[int, str]:
+        """Soft-delete memories containing **all** of the given tags.
+
+        Distinct from delete_by_tags (which has OR semantics in some
+        callers and ANY semantics across the suite). This one matches
+        only memories whose tag set is a superset of the input.
+        """
+        if not tags:
+            return 0, "No tags provided"
+        try:
+            pool = await self._ensure_pool()
+            stripped = [t.strip() for t in tags if t and t.strip()]
+            if not stripped:
+                return 0, "No valid tags after stripping"
+            async with pool.acquire() as conn:
+                result = await conn.execute(
+                    f"""
+                    UPDATE {self._t(_MEMORIES_TABLE)}
+                    SET deleted_at = NOW()
+                    WHERE tags @> $1::text[] AND deleted_at IS NULL
+                    """,
+                    stripped,
+                )
+            try:
+                affected = int(result.split()[-1])
+            except Exception:
+                affected = 0
+            return affected, f"Deleted {affected} memories containing all of: {', '.join(stripped)}"
+        except Exception as e:
+            logger.error("delete_by_all_tags() failed: %s", e)
+            return 0, f"Failed to delete by all tags: {e}"
+
     async def delete_by_tag(self, tag: str) -> Tuple[int, str]:
         try:
             pool = await self._ensure_pool()
