@@ -949,6 +949,156 @@ class PgVectorMemoryStorage(MemoryStorage):
             logger.error("get_all_tags() failed: %s", e)
             return []
 
+    async def get_largest_memories(self, n: int = 10) -> List[Memory]:
+        """Top-N memories by content length (analytics 'largest items' view)."""
+        try:
+            pool = await self._ensure_pool()
+            async with pool.acquire() as conn:
+                rows = await conn.fetch(
+                    f"""
+                    SELECT content_hash, content, tags, memory_type, metadata,
+                           created_at, updated_at, created_at_iso, updated_at_iso
+                    FROM {self._t(_MEMORIES_TABLE)}
+                    WHERE deleted_at IS NULL
+                    ORDER BY length(content) DESC
+                    LIMIT $1
+                    """,
+                    n,
+                )
+            return [_row_to_memory(r) for r in rows]
+        except Exception as e:
+            logger.error("get_largest_memories() failed: %s", e)
+            return []
+
+    async def recall(
+        self,
+        query: Optional[str] = None,
+        n_results: int = 5,
+        start_timestamp: Optional[float] = None,
+        end_timestamp: Optional[float] = None,
+    ) -> List[MemoryQueryResult]:
+        """Time-windowed recall, optionally combined with semantic search.
+
+        - Both query AND timestamps: ANN search restricted to the time
+          window, ranked by similarity.
+        - Query only: equivalent to retrieve().
+        - Timestamps only: chronological listing of memories in window
+          (no embedding required), with relevance_score=1.0.
+        """
+        try:
+            pool = await self._ensure_pool()
+
+            extras: List[str] = []
+            params: List[Any] = []
+
+            if query:
+                # Generate the query embedding once.
+                params.append(await self._embed(query))
+                qe_idx = len(params)
+            else:
+                qe_idx = None
+
+            if start_timestamp is not None:
+                params.append(start_timestamp)
+                extras.append(f"AND m.created_at >= ${len(params)}")
+            if end_timestamp is not None:
+                params.append(end_timestamp)
+                extras.append(f"AND m.created_at <= ${len(params)}")
+
+            params.append(n_results)
+            limit_idx = len(params)
+
+            if qe_idx is not None:
+                sql = f"""
+                    SELECT m.content_hash, m.content, m.tags, m.memory_type, m.metadata,
+                           m.created_at, m.updated_at, m.created_at_iso, m.updated_at_iso,
+                           1 - (e.embedding <=> ${qe_idx}::vector) AS similarity
+                    FROM {self._t(_MEMORIES_TABLE)} m
+                    JOIN {self._t(_EMBEDDINGS_TABLE)} e ON e.memory_id = m.id
+                    WHERE m.deleted_at IS NULL {' '.join(extras)}
+                    ORDER BY e.embedding <=> ${qe_idx}::vector
+                    LIMIT ${limit_idx}
+                """
+            else:
+                sql = f"""
+                    SELECT m.content_hash, m.content, m.tags, m.memory_type, m.metadata,
+                           m.created_at, m.updated_at, m.created_at_iso, m.updated_at_iso,
+                           1.0::float AS similarity
+                    FROM {self._t(_MEMORIES_TABLE)} m
+                    WHERE m.deleted_at IS NULL {' '.join(extras)}
+                    ORDER BY m.created_at DESC
+                    LIMIT ${limit_idx}
+                """
+
+            async with pool.acquire() as conn:
+                rows = await conn.fetch(sql, *params)
+
+            return [
+                MemoryQueryResult(
+                    memory=_row_to_memory(r),
+                    relevance_score=float(r["similarity"]),
+                    debug_info={"backend": "pgvector", "mode": "recall"},
+                )
+                for r in rows
+            ]
+        except Exception as e:
+            logger.error("recall() failed: %s\n%s", e, traceback.format_exc())
+            return []
+
+    async def recall_by_timeframe(
+        self,
+        start_date: str,
+        end_date: str,
+        n_results: int = 10000,
+    ) -> List[Memory]:
+        """Memories created within [start_date, end_date] inclusive.
+
+        Dates are 'YYYY-MM-DD' strings. Used by quality analytics.
+        """
+        try:
+            start_ts = datetime.fromisoformat(start_date).replace(tzinfo=timezone.utc).timestamp()
+            # Inclusive end: bump to end-of-day so the whole day is covered.
+            end_dt = datetime.fromisoformat(end_date).replace(tzinfo=timezone.utc)
+            end_ts = end_dt.timestamp() + 86400 - 1
+            return await self.get_memories_by_time_range(start_ts, end_ts)
+        except Exception as e:
+            logger.error("recall_by_timeframe() failed: %s", e)
+            return []
+
+    async def search_all_memories(self) -> List[Memory]:
+        """Return every active memory. Heavy — caller is expected to bound
+        scope via tags/time first when possible."""
+        return await self.get_all_memories()
+
+    async def semantic_search(self, query: str, n_results: int = 10) -> List[MemoryQueryResult]:
+        """Alias for retrieve() — kept for compatibility with the quality
+        analytics endpoint which calls semantic_search() directly."""
+        return await self.retrieve(query=query, n_results=n_results)
+
+    async def get_all_tags_with_counts(self) -> List[Dict[str, Any]]:
+        """Return tags + usage counts, sorted by count desc.
+
+        Used by the dashboard's /api/tags endpoint and analytics views.
+        Postgres `unnest(tags)` flattens the text[] column so a single
+        GROUP BY produces the histogram in one query.
+        """
+        try:
+            pool = await self._ensure_pool()
+            async with pool.acquire() as conn:
+                rows = await conn.fetch(
+                    f"""
+                    SELECT tag, COUNT(*) AS c
+                    FROM {self._t(_MEMORIES_TABLE)}, unnest(tags) AS tag
+                    WHERE deleted_at IS NULL
+                    GROUP BY tag
+                    ORDER BY c DESC, tag ASC
+                    """
+                )
+            return [{"tag": r["tag"], "count": int(r["c"])} for r in rows]
+        except Exception as e:
+            logger.error("get_all_tags_with_counts() failed: %s", e)
+            return []
+
     # --------------------------------------------------------------- stats
 
     async def get_stats(self) -> Dict[str, Any]:

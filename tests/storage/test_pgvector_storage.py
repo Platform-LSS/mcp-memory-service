@@ -349,6 +349,90 @@ class TestPgVectorIntegration:
         assert stats["status"] == "operational"
         assert stats["total_memories"] >= 2
 
+    async def test_get_all_tags_with_counts_returns_histogram(self, real_storage):
+        """Dashboard /api/tags endpoint relies on this — without it the
+        Browse view crashes with a 501. Verify the histogram structure
+        and ordering."""
+        await real_storage.store(_make_memory("a", tags=["topic:auth", "q:high"]))
+        await real_storage.store(_make_memory("b", tags=["topic:auth"]))
+        await real_storage.store(_make_memory("c", tags=["topic:auth", "q:high"]))
+        await real_storage.store(_make_memory("d", tags=["q:high"]))
+
+        result = await real_storage.get_all_tags_with_counts()
+        assert isinstance(result, list)
+        assert all("tag" in r and "count" in r for r in result)
+
+        counts = {r["tag"]: r["count"] for r in result}
+        # __test__ is on every fixture-created memory; topic:auth on 3, q:high on 3
+        assert counts["topic:auth"] == 3
+        assert counts["q:high"] == 3
+
+        # Sorted by count desc — the largest entry should be at index 0
+        assert result[0]["count"] >= result[-1]["count"]
+
+    async def test_get_largest_memories_orders_by_length(self, real_storage):
+        await real_storage.store(_make_memory("short"))
+        await real_storage.store(_make_memory("medium " * 5))
+        await real_storage.store(_make_memory("loooong " * 50))
+
+        top = await real_storage.get_largest_memories(n=3)
+        assert len(top) == 3
+        # Largest first
+        lengths = [len(m.content) for m in top]
+        assert lengths == sorted(lengths, reverse=True)
+
+    async def test_recall_query_only_uses_semantic_path(self, real_storage):
+        target = _make_memory("recall test — orange marmalade recipe")
+        await real_storage.store(target)
+
+        results = await real_storage.recall(query="orange marmalade", n_results=3)
+        assert any(r.memory.content_hash == target.content_hash for r in results)
+        # Semantic path returns relevance_scores < 1.0 (cosine similarity)
+        assert all(r.relevance_score <= 1.0 for r in results)
+
+    async def test_recall_timestamp_only_returns_chronological(self, real_storage):
+        m1 = _make_memory("ts test 1")
+        m2 = _make_memory("ts test 2")
+        await real_storage.store(m1)
+        await real_storage.store(m2)
+
+        # Wide window covering both stores
+        results = await real_storage.recall(
+            start_timestamp=0, end_timestamp=time.time() + 60, n_results=100
+        )
+        hashes = {r.memory.content_hash for r in results}
+        assert {m1.content_hash, m2.content_hash}.issubset(hashes)
+        # Timestamp-only path stamps relevance_score = 1.0
+        for r in results:
+            if r.memory.content_hash in {m1.content_hash, m2.content_hash}:
+                assert r.relevance_score == 1.0
+
+    async def test_recall_by_timeframe_returns_in_window(self, real_storage):
+        memory = _make_memory("timeframe test")
+        await real_storage.store(memory)
+
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        results = await real_storage.recall_by_timeframe(today, today, n_results=100)
+        hashes = {m.content_hash for m in results}
+        assert memory.content_hash in hashes
+
+    async def test_semantic_search_aliases_retrieve(self, real_storage):
+        memory = _make_memory("semantic search alias check")
+        await real_storage.store(memory)
+
+        results = await real_storage.semantic_search("semantic search alias", n_results=3)
+        assert any(r.memory.content_hash == memory.content_hash for r in results)
+
+    async def test_search_all_memories_returns_active(self, real_storage):
+        m1 = _make_memory("all memories 1")
+        m2 = _make_memory("all memories 2")
+        await real_storage.store(m1)
+        await real_storage.store(m2)
+
+        all_mems = await real_storage.search_all_memories()
+        hashes = {m.content_hash for m in all_mems}
+        assert {m1.content_hash, m2.content_hash}.issubset(hashes)
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
