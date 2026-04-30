@@ -1,0 +1,59 @@
+## S3 backup sidecar for the pgvector backend.
+##
+## Layers on top of docker-compose.traefik.yml + docker-compose.postgres.yml:
+##
+##   docker compose -p mcp-memory \
+##     -f tools/docker/docker-compose.traefik.yml \
+##     -f tools/docker/docker-compose.postgres.yml \
+##     -f tools/docker/docker-compose.backup.yml \
+##     --env-file tools/docker/.env \
+##     up -d --build
+##
+## Schedule:    every 4h on UTC boundaries (00, 04, 08, 12, 16, 20 UTC)
+## Retention:   hourly/ prefix expires after 10 days (S3 lifecycle rule);
+##              monthly/ prefix kept forever (1st of month, 00:00 UTC)
+## Restore:     scripts/team/restore_from_s3.sh
+##
+## Required env (in tools/docker/.env, see .env.team.example):
+##   POSTGRES_PASSWORD          — already required by docker-compose.postgres.yml
+##   BACKUP_S3_BUCKET           — name of the S3 bucket
+##   BACKUP_AWS_REGION          — bucket region (e.g. eu-west-1)
+##   BACKUP_AWS_ACCESS_KEY_ID   — IAM user with PutObject on the bucket
+##   BACKUP_AWS_SECRET_ACCESS_KEY
+
+services:
+  mcp-memory-backup:
+    build:
+      context: ./backup
+      dockerfile: Dockerfile
+    image: mcp-memory-backup:team
+    container_name: mcp-memory-backup
+    restart: unless-stopped
+
+    depends_on:
+      mcp-memory-postgres:
+        condition: service_healthy
+
+    environment:
+      PGHOST: mcp-memory-postgres
+      PGPORT: "5432"
+      PGUSER: mcp_memory
+      PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      PGDATABASE: mcp_memory
+
+      AWS_ACCESS_KEY_ID: ${BACKUP_AWS_ACCESS_KEY_ID:?BACKUP_AWS_ACCESS_KEY_ID is required}
+      AWS_SECRET_ACCESS_KEY: ${BACKUP_AWS_SECRET_ACCESS_KEY:?BACKUP_AWS_SECRET_ACCESS_KEY is required}
+      AWS_DEFAULT_REGION: ${BACKUP_AWS_REGION:?BACKUP_AWS_REGION is required}
+      BACKUP_S3_BUCKET: ${BACKUP_S3_BUCKET:?BACKUP_S3_BUCKET is required}
+
+    networks:
+      - mcp_memory_internal
+
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+        reservations:
+          cpus: "0.05"
+          memory: 64M
