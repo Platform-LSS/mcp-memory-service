@@ -7,7 +7,8 @@ to directly access memory operations using the MCP standard.
 
 import json
 import logging
-from typing import Dict, Any, Optional, Union
+import os
+from typing import Dict, Any, Callable, List, Optional, Union
 from fastapi import APIRouter, Depends, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
@@ -22,6 +23,43 @@ from ..oauth.middleware import require_read_access, AuthenticationResult
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/mcp", tags=["mcp"])
+
+
+def _max_response_chars() -> int:
+    """Read MCP_MAX_RESPONSE_CHARS env var (0 = unlimited)."""
+    raw = os.environ.get("MCP_MAX_RESPONSE_CHARS", "0")
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 0
+
+
+def _pack_within_cap(
+    items: List[Any],
+    to_dict: Callable[[Any], Dict[str, Any]],
+) -> tuple[List[Dict[str, Any]], int]:
+    """
+    Serialize items one-by-one, stopping when the cumulative JSON size would
+    exceed MCP_MAX_RESPONSE_CHARS. Returns (packed_dicts, dropped_count).
+
+    Acts as a safety net for the HTTP MCP transport so a broad query never
+    produces a response the client can't ingest.
+    """
+    cap = _max_response_chars()
+    if cap <= 0:
+        return [to_dict(it) for it in items], 0
+
+    packed: List[Dict[str, Any]] = []
+    running = 2  # opening/closing brackets of the JSON array
+    for it in items:
+        d = to_dict(it)
+        size = len(json.dumps(d, default=str)) + 1  # comma
+        if running + size > cap and packed:
+            # Stop here; don't include this item — keep what we have.
+            return packed, len(items) - len(packed)
+        packed.append(d)
+        running += size
+    return packed, 0
 
 
 class MCPRequest(BaseModel):
@@ -275,49 +313,52 @@ async def handle_tool_call(storage, tool_name: str, arguments: Dict[str, Any]) -
         query = arguments.get("query") or arguments.get("content")
         limit = arguments.get("limit", 10)
         similarity_threshold = arguments.get("similarity_threshold", 0.0)
-        
-        # Get results from storage (no similarity filtering at storage level)
+
         results = await storage.retrieve(query=query, n_results=limit)
-        
-        # Apply similarity threshold filtering (same as API implementation)
+
         if similarity_threshold is not None:
             results = [
                 result for result in results
                 if result.relevance_score and result.relevance_score >= similarity_threshold
             ]
-        
+
+        packed, dropped = _pack_within_cap(
+            results,
+            lambda r: {
+                "content": r.memory.content,
+                "content_hash": r.memory.content_hash,
+                "tags": r.memory.tags,
+                "similarity_score": r.relevance_score,
+                "created_at": r.memory.created_at_iso,
+            },
+        )
         return {
-            "results": [
-                {
-                    "content": r.memory.content,
-                    "content_hash": r.memory.content_hash,
-                    "tags": r.memory.tags,
-                    "similarity_score": r.relevance_score,
-                    "created_at": r.memory.created_at_iso
-                }
-                for r in results
-            ],
-            "total_found": len(results)
+            "results": packed,
+            "total_found": len(results),
+            "size_truncated": dropped > 0,
+            "dropped_due_to_size": dropped,
         }
 
     elif tool_name == "recall_memory":
         query = arguments.get("query") or arguments.get("content")
         n_results = arguments.get("n_results", 5)
 
-        # Use storage recall_memory method which handles time expressions
         memories = await storage.recall_memory(query=query, n_results=n_results)
 
+        packed, dropped = _pack_within_cap(
+            memories,
+            lambda m: {
+                "content": m.content,
+                "content_hash": m.content_hash,
+                "tags": m.tags,
+                "created_at": m.created_at_iso,
+            },
+        )
         return {
-            "results": [
-                {
-                    "content": m.content,
-                    "content_hash": m.content_hash,
-                    "tags": m.tags,
-                    "created_at": m.created_at_iso
-                }
-                for m in memories
-            ],
-            "total_found": len(memories)
+            "results": packed,
+            "total_found": len(memories),
+            "size_truncated": dropped > 0,
+            "dropped_due_to_size": dropped,
         }
 
     elif tool_name == "search_by_tag":
@@ -333,20 +374,23 @@ async def handle_tool_call(storage, tool_name: str, arguments: Dict[str, Any]) -
         end = start + n_results
         page_results = results[start:end]
 
+        packed, dropped = _pack_within_cap(
+            page_results,
+            lambda memory: {
+                "content": memory.content,
+                "content_hash": memory.content_hash,
+                "tags": memory.tags,
+                "created_at": memory.created_at_iso,
+            },
+        )
         return {
-            "results": [
-                {
-                    "content": memory.content,
-                    "content_hash": memory.content_hash,
-                    "tags": memory.tags,
-                    "created_at": memory.created_at_iso
-                }
-                for memory in page_results
-            ],
+            "results": packed,
             "total_found": total_found,
             "page": page,
             "page_size": n_results,
-            "has_more": end < total_found,
+            "has_more": end < total_found or dropped > 0,
+            "size_truncated": dropped > 0,
+            "dropped_due_to_size": dropped,
         }
     
     elif tool_name == "delete_memory":
