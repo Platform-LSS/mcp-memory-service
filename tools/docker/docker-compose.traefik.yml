@@ -57,6 +57,11 @@ services:
       MCP_QUALITY_SYSTEM_ENABLED: "true"
       MCP_CONSOLIDATION_ENABLED: "true"
 
+      # Cap each tool result at ~25K chars (~6K tokens) so a broad query
+      # never exceeds Claude Code's tool-output limit. Truncation adds a
+      # "showing N of M" footer; callers paginate or narrow.
+      MCP_MAX_RESPONSE_CHARS: ${MCP_MAX_RESPONSE_CHARS:-25000}
+
       # External embeddings — llama.cpp (llama-server) on the docker host
       # Serving nomic-embed-text-v1.5-f16.gguf at 768 dim
       MCP_EXTERNAL_EMBEDDING_URL: ${MCP_EXTERNAL_EMBEDDING_URL:-http://host.docker.internal:11435/v1/embeddings}
