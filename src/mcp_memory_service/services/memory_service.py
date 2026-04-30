@@ -586,39 +586,54 @@ class MemoryService:
     async def search_by_tag(
         self,
         tags: Union[str, List[str]],
-        match_all: bool = False
+        match_all: bool = False,
+        page: int = 1,
+        page_size: int = 50,
     ) -> Union[SearchByTagSuccess, SearchByTagError]:
         """
-        Search memories by tags with flexible matching options.
+        Search memories by tags with pagination.
 
         Args:
             tags: Tag or list of tags to search for
             match_all: If True, memory must have ALL tags; if False, ANY tag
+            page: 1-based page number
+            page_size: results per page (1..500)
 
         Returns:
-            Dictionary with matching memories
+            {memories, tags, match_type, count, total_found, page, page_size, has_more}
         """
+        # Validate pagination — clamp to a hard ceiling so a buggy caller
+        # can't pull the whole bag in a single MCP/HTTP round-trip.
+        page = max(1, int(page))
+        page_size = max(1, min(500, int(page_size)))
+
         try:
-            # Normalize tags to list (handles all formats including comma-separated)
             tags = normalize_tags(tags)
 
-            # Search using database-level filtering
-            # Note: Using search_by_tag from base class (singular)
             memories = await self.storage.search_by_tag(tags=tags)
 
-            # Format results
-            results = []
-            for memory in memories:
-                results.append(self._format_memory_response(memory))
+            # match_all narrows the set; default search_by_tag is OR.
+            if match_all and len(tags) > 1:
+                tag_set = set(tags)
+                memories = [m for m in memories if tag_set.issubset(set(m.tags))]
 
-            # Determine match type description
+            total_found = len(memories)
+            start = (page - 1) * page_size
+            end = start + page_size
+            page_memories = memories[start:end]
+
+            results = [self._format_memory_response(m) for m in page_memories]
             match_type = "ALL" if match_all else "ANY"
 
             return {
                 "memories": results,
                 "tags": tags,
                 "match_type": match_type,
-                "count": len(results)
+                "count": len(results),
+                "total_found": total_found,
+                "page": page,
+                "page_size": page_size,
+                "has_more": end < total_found,
             }
 
         except Exception as e:

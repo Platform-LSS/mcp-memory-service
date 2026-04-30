@@ -62,6 +62,8 @@ class TagSearchRequest(BaseModel):
     tags: List[str] = Field(..., description="List of tags to search for (ANY match)")
     match_all: bool = Field(default=False, description="If true, memory must have ALL tags; if false, ANY tag")
     time_filter: Optional[str] = Field(None, description="Optional natural language time filter (e.g., 'last week', 'yesterday')")
+    page: int = Field(default=1, ge=1, description="1-based page number")
+    page_size: int = Field(default=10, ge=1, le=100, description="Results per page (max 100)")
 
 
 class TimeSearchRequest(BaseModel):
@@ -240,6 +242,12 @@ async def tag_search(
                 if tag_set.issubset(set(memory.tags))
             ]
 
+        # Paginate after filtering so total_found reflects the true match count
+        total_found = len(memories)
+        start = (request.page - 1) * request.page_size
+        end = start + request.page_size
+        page_memories = memories[start:end]
+
         # Convert to search results
         match_type = "ALL" if request.match_all else "ANY"
         search_results = [
@@ -247,15 +255,16 @@ async def tag_search(
                 memory,
                 reason=f"Tags match ({match_type}): {', '.join(set(memory.tags) & set(request.tags))}"
             )
-            for memory in memories
+            for memory in page_memories
         ]
 
         processing_time = (time.time() - start_time) * 1000
 
-        # Build query string with time filter info if present
+        # Build query string with pagination + time filter info
         query_string = f"Tags: {', '.join(request.tags)} ({match_type})"
         if request.time_filter:
             query_string += f" | Time: {request.time_filter}"
+        query_string += f" | page {request.page} of {max(1, (total_found + request.page_size - 1) // request.page_size)}"
 
         # Broadcast SSE event for search completion
         try:
@@ -271,7 +280,7 @@ async def tag_search(
 
         return SearchResponse(
             results=search_results,
-            total_found=len(search_results),
+            total_found=total_found,
             query=query_string,
             search_type="tag",
             processing_time_ms=processing_time

@@ -506,6 +506,9 @@ async def handle_search_by_tag(server, arguments: dict) -> List[types.TextConten
 
     tags = normalize_tags(arguments.get("tags", []))
     max_response_chars = _get_max_response_chars(arguments)
+    n_results = int(arguments.get("n_results", 50))
+    page = int(arguments.get("page", 1))
+    match_all = bool(arguments.get("match_all", False))
 
     if not tags:
         return [types.TextContent(type="text", text="Error: Tags are required")]
@@ -515,7 +518,12 @@ async def handle_search_by_tag(server, arguments: dict) -> List[types.TextConten
         await server._ensure_storage_initialized()
 
         # Call shared MemoryService business logic
-        result = await server.memory_service.search_by_tag(tags=tags)
+        result = await server.memory_service.search_by_tag(
+            tags=tags,
+            match_all=match_all,
+            page=page,
+            page_size=n_results,
+        )
 
         if result.get("error"):
             return [types.TextContent(type="text", text=f"Error searching by tags: {result['error']}")]
@@ -526,6 +534,17 @@ async def handle_search_by_tag(server, arguments: dict) -> List[types.TextConten
                 type="text",
                 text=f"No memories found with tags: {', '.join(tags)}"
             )]
+
+        total_found = result.get("total_found", len(memories))
+        cur_page = result.get("page", 1)
+        page_size = result.get("page_size", n_results)
+        has_more = result.get("has_more", False)
+        total_pages = max(1, (total_found + page_size - 1) // page_size)
+        pagination_header = (
+            f"Showing {len(memories)} of {total_found} matches "
+            f"(page {cur_page}/{total_pages}, page_size={page_size}). "
+            + ("More results available — increase page or n_results." if has_more else "End of results.")
+        )
 
         # Apply truncation if max_response_chars is specified
         truncated_response = _get_truncated_response_if_needed(
@@ -564,7 +583,7 @@ async def handle_search_by_tag(server, arguments: dict) -> List[types.TextConten
 
         return [types.TextContent(
             type="text",
-            text="Found the following memories:\n\n" + "\n".join(formatted_results)
+            text=f"{pagination_header}\n\n" + "\n".join(formatted_results)
         )]
     except Exception as e:
         logger.error(f"Error searching by tags: {str(e)}\n{traceback.format_exc()}")

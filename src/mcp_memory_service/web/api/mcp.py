@@ -98,12 +98,14 @@ MCP_TOOLS = [
     ),
     MCPTool(
         name="search_by_tag",
-        description="Search memories by specific tags",
+        description="Search memories by specific tags (paginated)",
         inputSchema={
-            "type": "object", 
+            "type": "object",
             "properties": {
                 "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags to search for"},
-                "operation": {"type": "string", "enum": ["AND", "OR"], "description": "Tag search operation", "default": "AND"}
+                "operation": {"type": "string", "enum": ["AND", "OR"], "description": "Tag search operation", "default": "AND"},
+                "n_results": {"type": "integer", "description": "Results per page (1..500)", "default": 50, "minimum": 1, "maximum": 500},
+                "page": {"type": "integer", "description": "1-based page number", "default": 1, "minimum": 1}
             },
             "required": ["tags"]
         }
@@ -321,9 +323,16 @@ async def handle_tool_call(storage, tool_name: str, arguments: Dict[str, Any]) -
     elif tool_name == "search_by_tag":
         tags = arguments.get("tags")
         operation = arguments.get("operation", "AND")
-        
+        n_results = max(1, min(500, int(arguments.get("n_results", 50))))
+        page = max(1, int(arguments.get("page", 1)))
+
         results = await storage.search_by_tags(tags=tags, operation=operation)
-        
+
+        total_found = len(results)
+        start = (page - 1) * n_results
+        end = start + n_results
+        page_results = results[start:end]
+
         return {
             "results": [
                 {
@@ -332,9 +341,12 @@ async def handle_tool_call(storage, tool_name: str, arguments: Dict[str, Any]) -
                     "tags": memory.tags,
                     "created_at": memory.created_at_iso
                 }
-                for memory in results
+                for memory in page_results
             ],
-            "total_found": len(results)
+            "total_found": total_found,
+            "page": page,
+            "page_size": n_results,
+            "has_more": end < total_found,
         }
     
     elif tool_name == "delete_memory":
